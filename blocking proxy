@@ -1,0 +1,213 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <netdb.h>
+#include <arpa/inet.h>
+
+#define PQLEN 8
+#define BUFLEN 65536
+
+typedef struct con {
+    char *rawURL;
+    char *method;
+    char *host;
+    char *port;
+    char *rawPath;
+    char *protocol;
+    char **fields;
+    int client;
+    int server;
+} con;
+
+int i;
+int proxy;
+con g;
+const char bl[] = "torrentz.eu\nmakemoney.com\nlottoforever.com\nwww.torrentz.eu\nwww.makemoney.com\nwww.lottoforever.com\n";
+char buf[BUFLEN]; // to avoid big amount malloc/free
+
+
+// tool fun
+static inline void error(const char *msg) {
+    perror(msg);
+    exit(1);
+}
+
+static inline void printLog(const char *url) {
+    if (url == 0) url = "unknown URL";
+    printf("LOG: request for (%s) finished\n", url);
+}
+
+static inline int charCount(const char *str, char chr) {
+    int ret = 0;
+    for (i = 0; str[i]; i++) ret += str[i] == chr;
+    return ret;
+}
+
+// impl
+static inline int isBlocked() {
+    return strstr(bl, g.host) != 0;
+}
+
+static inline int newProxy(int port, int qlen) {
+    int server = socket(AF_INET, SOCK_STREAM, 0);
+    if (server == -1)
+        error("cannot create server");
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons((uint16_t) port);
+    address.sin_addr.s_addr = INADDR_ANY;
+    if (bind(server, (struct sockaddr *) &address, sizeof(address)) < 0)
+        error("cannot bind");
+    if (listen(server, qlen) < 0)
+        error("cannot listen");
+    return server;
+}
+
+static inline void HTTPError(int fd, int status, char *msg) {
+    const char *format = "HTTP/1.1 %d %s\r\nContent-Length: %d\r\n\r\n%s";
+    const char *html = "<!DOCTYPE html><html><head><title>%d</title></head><body><h1>%d %s</h1></body></html>";
+    int contentLen = (int) strlen(html) + (int) strlen(msg);
+    char htmlBuf[contentLen];
+    sprintf(htmlBuf, html, status, status, msg);
+    char buf[strlen(format) + strlen(msg) + contentLen + 10];
+    sprintf(buf, format, status, msg, contentLen, htmlBuf);
+    send(fd, buf, strlen(buf), 0);
+}
+
+int out(struct addrinfo *addr) {
+    int server = socket(addr->ai_family, SOCK_STREAM, addr->ai_protocol);
+    if (server == -1) return -1;
+    if (connect(server, addr->ai_addr, addr->ai_addrlen) == -1) {
+        close(server);
+        return -1;
+    }
+    return server;
+}
+
+int end(int status, char *msg) {
+    if (status) HTTPError(g.client, status, msg);
+    free(g.port);
+    free(g.host);
+    free(g.method);
+    free(g.protocol);
+    free(g.rawURL);
+    free(g.rawPath);
+    close(g.client);
+    if (g.server != 0 && g.server != -1) close(g.server);
+    if (g.fields != 0) for (i = 0; g.fields[i] != 0; i++) free(g.fields[i]);
+    free(g.fields);
+    memset(&g, 0, sizeof(con));
+    return 0;
+}
+
+int parse(char *src, con *dst) {
+    char *crlf = strstr(src, "\r\n");
+    if (crlf == 0) return end(400, "Bad Request") - 1;
+    char *empty = strstr(src, "\r\n\r\n");
+    if (empty == 0) return end(400, "Bad Request") - 1;
+    *crlf = 0;
+    *(empty + 2) = 0;
+    // first line
+    char *space = strchr(src, ' ');
+    if (space == 0) return -1;
+    dst->method = strndup(src, space - src);
+    src = space + 1;
+    space = strchr(src, ' ');
+    dst->rawURL = strndup(src, space - src);
+    dst->protocol = strdup(space + 1);
+    char *base = dst->rawURL;
+    char *current = strstr(base, "://");
+    if (current != 0) base = current + 3;
+    current = strchr(base, '/');
+    if (current != 0) {
+        dst->rawPath = strdup(current);
+    } else {
+        dst->rawPath = strdup("/");
+        current = strchr(base, 0);
+    }
+    char *end = current;
+    current = strchr(base, ':');
+    if (current != 0 && current < end) {
+        dst->host = strndup(base, current - base);
+        dst->port = strndup(current + 1, end - current - 1);
+    } else {
+        dst->host = strndup(base, end - base);
+        dst->port = strdup("80");
+    }
+    // whole body
+    int count = charCount(crlf + 2, '\n');
+    dst->fields = malloc((count + 2) * sizeof(void *));
+    memset(dst->fields, 0, (count + 2) * sizeof(void *));
+    for (i = 0; i < count; i++) {
+        src = crlf + 2;
+        crlf = strstr(src, "\r\n");
+        *crlf = 0;
+        dst->fields[i] = strndup(src, crlf - src);
+    }
+    return 0;
+}
+
+
+void forward() {
+    char buf[strlen(g.method) + strlen(g.rawPath) + strlen(g.protocol) + 5];
+    sprintf(buf, "%s %s %s\r\n", g.method, g.rawPath, g.protocol);
+    send(g.server, buf, strlen(buf), 0);
+    for (i = 0; g.fields[i] != 0; i++) {
+        if (*g.fields[i] == 0) continue;
+        send(g.server, g.fields[i], strlen(g.fields[i]), 0);
+        send(g.server, "\r\n", 2, 0);
+    }
+    send(g.server, "\r\n", 2, 0);
+    printLog(g.rawURL);
+}
+
+int req() {
+    ssize_t len = recv(g.client, buf, BUFLEN, 0);
+    buf[len] = 0;
+    if (parse(buf, &g) == -1) return -1;
+    if (isBlocked()) return end(403, "Forbidden") - 1;
+    // set Connections to close
+    for (i = 0; g.fields[i] != 0; i++)
+        if (strstr(g.fields[i], "Connection:") != 0) {
+            free(g.fields[i]);
+            g.fields[i] = strdup("Connection: close");
+            i = 0;
+            break;
+        }
+    if (i != 0) g.fields[i] = strdup("Connection: close");
+    // connect to server
+    struct addrinfo *addr = 0;
+    if (getaddrinfo(g.host, g.port, 0, &addr)) {
+        freeaddrinfo(addr);
+        return end(504, "Gateway Timeout") - 1;
+    }
+    g.server = out(addr);
+    freeaddrinfo(addr);
+    if (g.server == -1) return end(504, "Gateway Timeout") - 1;
+    forward();
+    return 0;
+}
+
+void res() {
+    ssize_t len = 0;
+    do {
+        len = recv(g.server, buf, BUFLEN, 0);
+        if (len > 0) len = send(g.client, buf, len, MSG_NOSIGNAL);
+    } while (len > 0);
+    end(0, 0);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 1;
+    printf("CS656 project by group 5(kd226@njit.edu)\n");
+    proxy = newProxy(atoi(argv[1]), PQLEN);
+    struct sockaddr addr;
+    unsigned len;
+    while (1) {
+        g.client = accept(proxy, &addr, &len);
+        if (req() != -1) res();
+    }
+}
